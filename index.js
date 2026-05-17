@@ -41,22 +41,33 @@ function setCache(key, url) {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Convierte duración ISO 8601 (ej: "PT1M30S") a segundos.
+// Los Shorts duran 60 s o menos, por lo que cualquier valor > 60 es un video normal.
+function iso8601ToSeconds(duration) {
+  const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!match) return 0;
+  const hours   = parseInt(match[1] || 0);
+  const minutes = parseInt(match[2] || 0);
+  const seconds = parseInt(match[3] || 0);
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
 /**
  * GET /ultimo-video?channel_id=UCXXXXX
  *
- * Busca el video más reciente del canal (incluyendo Shorts) y redirige a él.
+ * Busca el video más reciente del canal (excluyendo Shorts) y redirige a él.
+ * Estrategia: obtiene los últimos 10 videos, consulta sus duraciones y
+ * descarta los que duren 60 s o menos (definición oficial de Short).
  */
 app.get('/ultimo-video', async (req, res) => {
   const { channel_id } = req.query;
 
-  // Validar que se recibió el parámetro
   if (!channel_id) {
     return res.status(400).json({
       error: 'Falta el parámetro channel_id. Ejemplo: /ultimo-video?channel_id=UCXXXXX',
     });
   }
 
-  // Revisar cache antes de llamar a la API
   const cachedUrl = getCached(channel_id);
   if (cachedUrl) {
     console.log(`[cache] Redirigiendo ${channel_id} → ${cachedUrl}`);
@@ -69,39 +80,55 @@ app.get('/ultimo-video', async (req, res) => {
   }
 
   try {
-    // YouTube Search API: lista videos del canal, ordenados por fecha descendente.
-    // type=video incluye Shorts (son videos normales con duración ≤ 60 s).
-    const response = await axios.get('https://www.googleapis.com/youtube/v3/search', {
+    // Paso 1: obtener los últimos 10 videos del canal ordenados por fecha.
+    // Se piden 10 para tener margen en caso de que varios sean Shorts consecutivos.
+    const searchRes = await axios.get('https://www.googleapis.com/youtube/v3/search', {
       params: {
         key: apiKey,
         channelId: channel_id,
         part: 'snippet',
-        order: 'date',       // más reciente primero
-        type: 'video',       // solo videos (incluye Shorts)
-        maxResults: 1,       // solo necesitamos el primero
+        order: 'date',
+        type: 'video',
+        maxResults: 10,
       },
     });
 
-    const items = response.data.items;
-
-    // Si el canal no tiene videos o el canal_id no existe
+    const items = searchRes.data.items;
     if (!items || items.length === 0) {
       return res.status(404).json({
         error: `No se encontraron videos para el canal: ${channel_id}`,
       });
     }
 
-    const videoId = items[0].id.videoId;
-    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    // Paso 2: consultar la duración de cada video con la API de Videos.
+    // contentDetails incluye el campo "duration" en formato ISO 8601.
+    const videoIds = items.map((item) => item.id.videoId).join(',');
+    const detailsRes = await axios.get('https://www.googleapis.com/youtube/v3/videos', {
+      params: {
+        key: apiKey,
+        id: videoIds,
+        part: 'contentDetails',
+      },
+    });
 
-    // Guardar en cache para las próximas peticiones
+    // Paso 3: quedarse con el primer video que dure más de 60 segundos.
+    const video = detailsRes.data.items.find((v) => {
+      return iso8601ToSeconds(v.contentDetails.duration) > 60;
+    });
+
+    if (!video) {
+      return res.status(404).json({
+        error: 'Los últimos 10 videos del canal son Shorts. No se encontró un video normal.',
+      });
+    }
+
+    const videoUrl = `https://www.youtube.com/watch?v=${video.id}`;
     setCache(channel_id, videoUrl);
 
     console.log(`[ok] Redirigiendo ${channel_id} → ${videoUrl}`);
     return res.redirect(videoUrl);
 
   } catch (err) {
-    // Error de la API de YouTube (quota excedida, canal privado, etc.)
     const apiError = err.response?.data?.error?.message || err.message;
     console.error(`[error] YouTube API: ${apiError}`);
     return res.status(500).json({
