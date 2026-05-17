@@ -52,12 +52,16 @@ function iso8601ToSeconds(duration) {
   return hours * 3600 + minutes * 60 + seconds;
 }
 
+// Límite de páginas a recorrer para no consumir cuota indefinidamente.
+// Con 5 páginas de 10 videos se revisan hasta 50 videos recientes.
+const MAX_PAGES = 5;
+
 /**
  * GET /ultimo-video?channel_id=UCXXXXX
  *
- * Busca el video más reciente del canal (excluyendo Shorts) y redirige a él.
- * Estrategia: obtiene los últimos 10 videos, consulta sus duraciones y
- * descarta los que duren 60 s o menos (definición oficial de Short).
+ * Busca el video más reciente del canal excluyendo Shorts.
+ * Pagina los resultados de YouTube hasta encontrar un video de más de 60 s,
+ * o hasta agotar MAX_PAGES páginas.
  */
 app.get('/ultimo-video', async (req, res) => {
   const { channel_id } = req.query;
@@ -80,53 +84,58 @@ app.get('/ultimo-video', async (req, res) => {
   }
 
   try {
-    // Paso 1: obtener los últimos 10 videos del canal ordenados por fecha.
-    // Se piden 10 para tener margen en caso de que varios sean Shorts consecutivos.
-    const searchRes = await axios.get('https://www.googleapis.com/youtube/v3/search', {
-      params: {
-        key: apiKey,
-        channelId: channel_id,
-        part: 'snippet',
-        order: 'date',
-        type: 'video',
-        maxResults: 10,
-      },
-    });
+    let pageToken = undefined;
 
-    const items = searchRes.data.items;
-    if (!items || items.length === 0) {
-      return res.status(404).json({
-        error: `No se encontraron videos para el canal: ${channel_id}`,
+    for (let page = 0; page < MAX_PAGES; page++) {
+      // Paso 1: obtener una página de videos recientes del canal.
+      const searchRes = await axios.get('https://www.googleapis.com/youtube/v3/search', {
+        params: {
+          key: apiKey,
+          channelId: channel_id,
+          part: 'snippet',
+          order: 'date',
+          type: 'video',
+          maxResults: 10,
+          ...(pageToken && { pageToken }),
+        },
       });
+
+      const items = searchRes.data.items;
+
+      if (!items || items.length === 0) {
+        break; // No hay más resultados en el canal
+      }
+
+      // Paso 2: consultar la duración real de cada video en esta página.
+      const videoIds = items.map((item) => item.id.videoId).join(',');
+      const detailsRes = await axios.get('https://www.googleapis.com/youtube/v3/videos', {
+        params: {
+          key: apiKey,
+          id: videoIds,
+          part: 'contentDetails',
+        },
+      });
+
+      // Paso 3: buscar el primer video que dure más de 60 segundos (no es Short).
+      const video = detailsRes.data.items.find(
+        (v) => iso8601ToSeconds(v.contentDetails.duration) > 60
+      );
+
+      if (video) {
+        const videoUrl = `https://www.youtube.com/watch?v=${video.id}`;
+        setCache(channel_id, videoUrl);
+        console.log(`[ok] Página ${page + 1} — Redirigiendo ${channel_id} → ${videoUrl}`);
+        return res.redirect(videoUrl);
+      }
+
+      // Todos los de esta página son Shorts: pasar a la siguiente si existe.
+      pageToken = searchRes.data.nextPageToken;
+      if (!pageToken) break;
     }
 
-    // Paso 2: consultar la duración de cada video con la API de Videos.
-    // contentDetails incluye el campo "duration" en formato ISO 8601.
-    const videoIds = items.map((item) => item.id.videoId).join(',');
-    const detailsRes = await axios.get('https://www.googleapis.com/youtube/v3/videos', {
-      params: {
-        key: apiKey,
-        id: videoIds,
-        part: 'contentDetails',
-      },
+    return res.status(404).json({
+      error: `No se encontró ningún video (solo Shorts) en los últimos ${MAX_PAGES * 10} videos del canal.`,
     });
-
-    // Paso 3: quedarse con el primer video que dure más de 60 segundos.
-    const video = detailsRes.data.items.find((v) => {
-      return iso8601ToSeconds(v.contentDetails.duration) > 60;
-    });
-
-    if (!video) {
-      return res.status(404).json({
-        error: 'Los últimos 10 videos del canal son Shorts. No se encontró un video normal.',
-      });
-    }
-
-    const videoUrl = `https://www.youtube.com/watch?v=${video.id}`;
-    setCache(channel_id, videoUrl);
-
-    console.log(`[ok] Redirigiendo ${channel_id} → ${videoUrl}`);
-    return res.redirect(videoUrl);
 
   } catch (err) {
     const apiError = err.response?.data?.error?.message || err.message;
