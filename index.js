@@ -16,6 +16,7 @@
 require('dotenv').config()
 const express = require('express')
 const axios = require('axios')
+const path = require('path')
 
 const app = express()
 const PORT = process.env.PORT || 3000
@@ -136,7 +137,6 @@ app.get('/ultimo-video', async (req, res) => {
         const detail = detailsMap.get(item.id.videoId)
         if (!detail) return false
         const seconds = iso8601ToSeconds(detail.contentDetails.duration)
-        console.log(`[seconds] - ${seconds}s`)
 
         const title = (detail.snippet.title || '').toLowerCase()
         const description = (detail.snippet.description || '').toLowerCase()
@@ -176,13 +176,10 @@ app.get('/ultimo-video', async (req, res) => {
   }
 })
 
-// Ruta raíz informativa
+app.use(express.static(path.join(__dirname, 'public')))
+
 app.get('/', (req, res) => {
-  res.json({
-    mensaje: 'API de redirección al último video de YouTube',
-    uso: '/ultimo-video?channel_id=UCXXXXX',
-    documentacion: 'https://github.com/tu-usuario/tu-repo#readme'
-  })
+  res.sendFile(path.join(__dirname, 'public', 'index.html'))
 })
 
 // Solo levanta el servidor si se corre directamente (node index.js).
